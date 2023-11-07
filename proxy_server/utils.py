@@ -1,63 +1,78 @@
+import html
 import re
-from urllib.parse import urljoin, urlparse, urlunparse
 
-from bs4 import BeautifulSoup, NavigableString
 from cachetools import LRUCache
 
-from proxy_server.config import PROXY_HOST, PROXY_PORT, TARGET_URL
+from proxy_server.config import PROXY_HOST, PROXY_PORT
 
 SIX_LETTER_WORD_PATTERN = re.compile(r'\b(\w{6})\b')
+LINKS_PATTERN = re.compile(
+    r'<a\s+href="https://news\.ycombinator\.com([^"]*)"', re.IGNORECASE)
 CACHE = LRUCache(maxsize=100)
 
 
-def modify_text(text):
-    """Modify text by adding trademark symbol to six-letter words."""
-    return SIX_LETTER_WORD_PATTERN.sub(r'\1<sup>™</sup>', text)
+def _is_six_letter_alpha(word):
+    """Check if a word is six letters long and consists of alphabetic characters."""
+    return bool(SIX_LETTER_WORD_PATTERN.match(word))
 
 
-async def fetch_html(url, session):
+async def _fetch_html(url, session):
     """Fetch HTML content asynchronously."""
     async with session.get(url) as resp:
         resp.raise_for_status()
         return await resp.text()
 
 
-async def get_html_content(url, session):
+async def _get_html_content(url, session):
     """Get HTML content either from cache or by fetching it."""
     if url in CACHE:
         return CACHE[url]
-    html_content = await fetch_html(url, session)
+    html_content = await _fetch_html(url, session)
     CACHE[url] = html_content
     return html_content
 
 
-def modify_text_in_soup(soup):
-    """Modify text by adding trademark symbol to six-letter words in HTML soup."""
-    body_text_nodes = soup.body.find_all(string=True) if soup.body else []
-    for text_node in body_text_nodes:
-        if isinstance(text_node, NavigableString):
-            parent_tag = text_node.parent
-            if parent_tag.name != 'a' and len(text_node.string) >= 6:
-                text_node.replace_with(BeautifulSoup(
-                    modify_text(text_node), 'html.parser'))
+def _unescape_href(html_content):
+    """Unescape HTML href attributes."""
+    href_pattern = r'href="([^"]+)"'
+    hrefs = re.findall(href_pattern, html_content)
+    for href in hrefs:
+        decoded_href = html.unescape(href)
+        html_content = html_content.replace(
+            f'href="{href}"', f'href="{decoded_href}"')
+
+    return html_content
 
 
-def rewrite_links_in_soup(soup):
-    """Rewrite links in HTML soup to go through the proxy."""
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        if href.startswith(TARGET_URL):
-            parsed_href = urlparse(href)
-            path_query = urlunparse(
-                ('', '', parsed_href.path, '', parsed_href.query, ''))
-            a_tag['href'] = urljoin(
-                f'{PROXY_HOST}:{PROXY_PORT}', path_query)
+def _replace_links(html_content):
+    """Replace links in HTML with a proxy link."""
+    replacement = f'<a href="http://{PROXY_HOST}:{PROXY_PORT}\\1"'
+    return LINKS_PATTERN.sub(replacement, html_content)
+
+
+def _modify_text_inside_tags(html_content):
+    """Modify text by adding a trademark symbol to all six-letter words inside HTML tags."""
+    def replace(match):
+        text_inside_tags = match.group(1)
+        words = text_inside_tags.split()
+        modified_words = {}
+
+        for word in words:
+            if _is_six_letter_alpha(word):
+                if word not in modified_words:
+                    modified_word = f'{word}<sup>™</sup>'
+                    text_inside_tags = text_inside_tags.replace(
+                        word, modified_word)
+                    modified_words[word] = modified_word
+
+        return f'>{text_inside_tags}<'
+
+    modified_html = re.sub(r'>([^<]+)<', replace, html_content)
+
+    return modified_html
 
 
 async def process_html_response(url, session):
     """Process HTML response, modify content and return response."""
-    html_content = await get_html_content(url, session)
-    soup = BeautifulSoup(html_content, 'lxml')
-    modify_text_in_soup(soup)
-    rewrite_links_in_soup(soup)
-    return soup.prettify(formatter="html")
+    html_content = await _get_html_content(url, session)
+    return _modify_text_inside_tags(_replace_links(_unescape_href(html_content)))
