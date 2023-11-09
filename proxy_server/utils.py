@@ -1,19 +1,12 @@
-import html
 import re
 
+from bs4 import BeautifulSoup
 from cachetools import LRUCache
 
 from proxy_server.config import PROXY_HOST, PROXY_PORT
 
 SIX_LETTER_WORD_PATTERN = re.compile(r'\b(\w{6})\b')
-LINKS_PATTERN = re.compile(
-    r'<a\s+href="https://news\.ycombinator\.com([^"]*)"', re.IGNORECASE)
 CACHE = LRUCache(maxsize=100)
-
-
-def _is_six_letter_alpha(word):
-    """Check if a word is six letters long and consists of alphabetic characters."""
-    return bool(SIX_LETTER_WORD_PATTERN.match(word))
 
 
 async def _fetch_html(url, session):
@@ -32,47 +25,24 @@ async def _get_html_content(url, session):
     return html_content
 
 
-def _unescape_href(html_content):
-    """Unescape HTML href attributes."""
-    href_pattern = r'href="([^"]+)"'
-    hrefs = re.findall(href_pattern, html_content)
-    for href in hrefs:
-        decoded_href = html.unescape(href)
-        html_content = html_content.replace(
-            f'href="{href}"', f'href="{decoded_href}"')
-
-    return html_content
-
-
-def _replace_links(html_content):
+def modify_links(soup: BeautifulSoup):
     """Replace links in HTML with a proxy link."""
-    replacement = f'<a href="http://{PROXY_HOST}:{PROXY_PORT}\\1"'
-    return LINKS_PATTERN.sub(replacement, html_content)
+    for anchor_tag in soup.find_all('a', href=lambda href: href and href.startswith('https://news.ycombinator.com')):
+        anchor_tag['href'] = anchor_tag['href'].replace(
+            'https://news.ycombinator.com', f'{PROXY_HOST}:{PROXY_PORT}')
+
+    return soup
 
 
-def _modify_text_inside_tags(html_content):
-    """Modify text by adding a trademark symbol to all six-letter words inside HTML tags."""
-    def replace(match):
-        text_inside_tags = match.group(1)
-        words = text_inside_tags.split()
-        modified_words = {}
-
-        for word in words:
-            if _is_six_letter_alpha(word):
-                if word not in modified_words:
-                    modified_word = f'{word}<sup>™</sup>'
-                    text_inside_tags = text_inside_tags.replace(
-                        word, modified_word)
-                    modified_words[word] = modified_word
-
-        return f'>{text_inside_tags}<'
-
-    modified_html = re.sub(r'>([^<]+)<', replace, html_content)
-
-    return modified_html
+def add_trademark(soup: BeautifulSoup):
+    """Modify text by adding a trademark symbol to all six-letter words in text."""
+    for element in soup.find_all(string=True):
+        element.replace_with(SIX_LETTER_WORD_PATTERN.sub(r'\1™', str(element)))
+    return soup
 
 
 async def process_html_response(url, session):
     """Process HTML response, modify content and return response."""
     html_content = await _get_html_content(url, session)
-    return _modify_text_inside_tags(_replace_links(_unescape_href(html_content)))
+    soup = BeautifulSoup(html_content, 'html.parser')
+    return str(modify_links(add_trademark(soup)))
